@@ -14,6 +14,7 @@ from fastapi import FastAPI, Depends, HTTPException, status
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from pydantic import BaseModel
 from pydantic_settings import BaseSettings
+from nltk.tokenize import sent_tokenize
 # from fastapi import File, UploadFile
 # Suppress warnings
 warnings.filterwarnings('ignore')
@@ -75,6 +76,19 @@ def get_current_user(credentials: HTTPBasicCredentials = Depends(security)):
 # ==================== FastAPI App ====================
 app = FastAPI(title="Document Processing RAG Agent API")
 
+
+def _summarize_chunks(chunks: list[str], focus_keyword: str) -> str:
+    sentences = [s for chunk in chunks for s in sent_tokenize(chunk)]
+    # 1) Prefer sentences that mention both the focus and a time unit
+    for s in sentences:
+        if focus_keyword in s.lower() and any(u in s.lower() for u in ("month", "year")):
+            return s.strip()
+    # 2) Otherwise, fallback to first sentence with the focus keyword
+    for s in sentences:
+        if focus_keyword in s.lower():
+            return s.strip()
+    # 3) Last resort: first sentence at all
+    return sentences[0].strip() if sentences else ""
 # ==================== Pydantic Models ====================
 class QueryRequest(BaseModel):
     query: str
@@ -374,70 +388,33 @@ class LLMDecisionEngine:
         )
 
 
-    def create_decision_prompt(self, info: Dict[str, Any], chunks: List[Dict[str, Any]]) -> str:
-        # 1) Build chunk_data as a single text block
-        chunk_data = ""
-        for c in chunks:
-            chunk_data += f"--- {c['doc_id']}:{c['chunk_id']} ---\n{c['text']}\n"
+    def create_information_prompt(self, query: str, chunks: List[dict]) -> str:
+        """
+        Ask *only* for a JSON object with two keys:
+        - summary: a one- or two-sentence answer
+        - sources: array of "doc_id:chunk_id"
+        """
+    # build a short context block (all retrieved chunks)
+        chunk_data = "\n".join(f"--- {c['doc_id']}:{c['chunk_id']} ---\n{c['text']}"
+                            for c in chunks)
 
-        # 2) Serialize info for the {query_info} placeholder
-        #    Using json.dumps to keep it readable
-        query_info = json.dumps(info, indent=2)
+        return f"""
+            You are a professional insurance policy analyst. Answer succinctly **only** about the **pre-existing diseases (PED)** waiting period, ignoring any other waiting‐period references.
 
-        # 3) Inject into your prompt_template
-        prompt = f"""
-            You are a professional insurance policy analyst.
-
-            Context : Relevant policy clauses:
+            Clauses:(make sure to emphasise on important time durations such as expiration timelines etc.)
             {chunk_data}
 
-            User Query : Parsed details:
-            {query_info}
+            User Query:
+            {query}
 
-            Based on the above, craft a single, direct answer in fluent, formal language that mirrors the style and formatting of the examples below. Your response should:
-            1. Begin with the direct answer (“Yes, …” / “No, …” / “A grace period of …”).
-            2. Use full sentences, spelling out numbers in words and digits (e.g. “thirty-six (36) months”).
-            3. Include any applicable conditions or limits.
-            4. Avoid bullet points or lists—respond in paragraph form.
-            5. Refer precisely to policy terms (e.g. “waiting period,” “sub-limit,” “AYUSH Hospital”) as shown.
+            Please respond with JSON exactly:
+            {{
+            "summary": "<brief answer>",
+            "sources": ["<doc_id:chunk_id>", ...]
+            }}
+            (no extra text)
+            """    
 
-            Below are sample queries with the expected ideal output. **Do not alter these examples**:
-
-            1) Query :- What is the grace period for premium payment under the National Parivar Mediclaim Plus Policy?  
-            Expected output :- A grace period of thirty days is provided for premium payment after the due date to renew or continue the policy without losing continuity benefits.
-
-            2) Query :- What is the waiting period for pre-existing diseases (PED) to be covered?  
-            Expected output :- There is a waiting period of thirty-six (36) months of continuous coverage from the first policy inception for pre-existing diseases and their direct complications to be covered.
-
-            3) Query :- Does this policy cover maternity expenses, and what are the conditions?  
-            Expected output :- Yes, the policy covers maternity expenses, including childbirth and lawful medical termination of pregnancy. To be eligible, the female insured person must have been continuously covered for at least 24 months. The benefit is limited to two deliveries or terminations during the policy period.
-
-            4) Query :- What is the waiting period for cataract surgery?  
-            Expected output :- The policy has a specific waiting period of two (2) years for cataract surgery.
-
-            5) Query :- Are the medical expenses for an organ donor covered under this policy?  
-            Expected output :- Yes, the policy indemnifies the medical expenses for the organ donor's hospitalization for the purpose of harvesting the organ, provided the organ is for an insured person and the donation complies with the Transplantation of Human Organs Act, 1994.
-
-            6) Query :- What is the No Claim Discount (NCD) offered in this policy?  
-            Expected output :- A No Claim Discount of 5% on the base premium is offered on renewal for a one-year policy term if no claims were made in the preceding year. The maximum aggregate NCD is capped at 5% of the total base premium.
-
-            7) Query :- Is there a benefit for preventive health check-ups?  
-            Expected output :- Yes, the policy reimburses expenses for health check-ups at the end of every block of two continuous policy years, provided the policy has been renewed without a break. The amount is subject to the limits specified in the Table of Benefits.
-
-            8) Query :- How does the policy define a 'Hospital'?  
-            Expected output :- A hospital is defined as an institution with at least 10 inpatient beds (in towns with a population below ten lakhs) or 15 beds (in all other places), with qualified nursing staff and medical practitioners available 24/7, a fully equipped operation theatre, and which maintains daily records of patients.
-
-            9) Query :- What is the extent of coverage for AYUSH treatments?  
-            Expected output :- The policy covers medical expenses for inpatient treatment under Ayurveda, Yoga, Naturopathy, Unani, Siddha, and Homeopathy systems up to the Sum Insured limit, provided the treatment is taken in an AYUSH Hospital.
-
-            10) Query :- Are there any sub-limits on room rent and ICU charges for Plan A?  
-                Expected output :- Yes, for Plan A, the daily room rent is capped at 1% of the Sum Insured, and ICU charges are capped at 2% of the Sum Insured. These limits do not apply if the treatment is for a listed procedure in a Preferred Provider Network (PPN).
-
-            ---
-
-            Use this exact tone, level of detail, and formatting in your answer—then provide your response below:
-            """
-        return prompt
 
     def extract_json(self, txt: str):
         m = re.search(r'\{.*\}', txt, re.DOTALL)
@@ -461,12 +438,24 @@ class LLMDecisionEngine:
         data = self.extract_json(res.text)
         return data or self.fallback_decision(info, chunks)
 
-    def make_information(self, info, chunks):
-        # simpler prompt
-        prompt = f"Answer professionally based on: {[c['text'] for c in chunks]}"
-        res = self.model.generate_content(prompt)
-        return res.text
+    def make_information(self, query: str, chunks: list[dict]) -> dict:
+        prompt = self.create_information_prompt(query, chunks)
+        resp = self.model.generate_content(prompt)
+        text = resp.text.strip()
 
+        # 1) Try JSON parsing
+        parsed = self.extract_json(text)
+        if parsed:
+            return parsed
+
+        # 2) If JSON failed, **summarize the actual chunks** instead of echoing resp.text
+        raw_chunks = [c["text"] for c in chunks]
+        summary = _summarize_chunks(raw_chunks)
+
+        return {
+            "summary": summary,
+            "sources": [f"{c['doc_id']}:{c['chunk_id']}" for c in chunks]
+        }
 # DocumentQuerySystem
 class DocumentQuerySystem:
     def __init__(self):
@@ -540,13 +529,24 @@ class DocumentQuerySystem:
             "relevant_chunks":  chunks           # raw chunk objects with doc_id, chunk_id, text, score
         }, 0)
 
-    def process_query_for_information(self, q: str) -> Tuple[Any,int]:
-        if not self.inited: return ({'error':'Not initialized'},1)
-        chunks = self.ss.search(q, Config.TOP_K_RETRIEVAL)
-        if not chunks: return ({'error':'No info found'},1)
-        info = self.de.make_information(q, chunks)
-        return ({'query_info':q,'information':info,'relevant_chunks':chunks},0)
+    def process_query_for_information(self, query: str) -> Tuple[Dict[str, Any], int]:
+        if not self.inited:
+            return {"error": "Service not initialized"}, 503
 
+        # 1) Retrieve all relevant chunks (you said these are perfect already)
+        hits = self.ss.search(query, Config.TOP_K_RETRIEVAL)
+        if not hits:
+            return {"error": "No relevant information found"}, 404
+
+        # 2) Ask the LLM for a clean summary
+        info = self.de.make_information(query, hits)
+
+        # 3) Return exactly the summary + the chunks that produced it
+        return ({
+            "answer": info.get("summary"),
+            "relevant_clauses": [c["text"] for c in hits],
+            "sources":         [f"{c['doc_id']}:{c['chunk_id']}" for c in hits]
+        }, status.HTTP_200_OK)
 # ==================== App Startup ====================
 @app.on_event('startup')
 def on_startup():
