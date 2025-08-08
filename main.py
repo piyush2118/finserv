@@ -3,21 +3,22 @@ import json
 import re
 import warnings
 from io import BytesIO
-from typing import List, Dict, Any, Tuple
+from typing import List, Dict, Any, Tuple, Optional, Union
 
 import certifi
 import numpy as np
 import pandas as pd
 import requests
 from dotenv import load_dotenv
-from fastapi import FastAPI, Depends, HTTPException, status, Request
+from fastapi import FastAPI, Depends, HTTPException, status, Request, applications
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
-from pydantic import BaseModel
-from pydantic_settings import BaseSettings
+from pydantic import BaseModel, BaseSettings
 from nltk.tokenize import sent_tokenize
 # from fastapi import File, UploadFile
 # Suppress warnings
 warnings.filterwarnings('ignore')
+
+import google.generativeai as genai
 
 # Load environment variables
 load_dotenv()
@@ -25,6 +26,7 @@ load_dotenv()
 # ==================== Configuration ====================
 class Config:
     # Load from .env
+    FAISS_INDEX_PATH: str = os.getenv("FAISS_INDEX_PATH", "")
     GOOGLE_API_KEY: str = os.getenv('GOOGLE_API_KEY', '')
     EMBEDDING_MODEL: str = os.getenv('EMBEDDING_MODEL', 'all-MiniLM-L6-v2')
     GEMINI_MODEL: str = os.getenv('GEMINI_MODEL', 'gemini-1.5-flash')
@@ -62,6 +64,7 @@ EMPLOYEE_USER = os.getenv('EMPLOYEE_USERNAME', 'employee')
 EMPLOYEE_PASS = os.getenv('EMPLOYEE_PASSWORD', 'employeepass')
 USERS[EMPLOYEE_USER] = { 'password': EMPLOYEE_PASS, 'role': 'employee' }
 
+
 # Auth dependency
 def get_current_user(credentials: HTTPBasicCredentials = Depends(security)):
     user = USERS.get(credentials.username)
@@ -77,18 +80,28 @@ def get_current_user(credentials: HTTPBasicCredentials = Depends(security)):
 app = FastAPI(title="Document Processing RAG Agent API")
 
 
-def _summarize_chunks(chunks: list[str], focus_keyword: str) -> str:
+def _summarize_chunks(chunks: List[str], focus_keyword: Optional[str] = None) -> str:
     sentences = [s for chunk in chunks for s in sent_tokenize(chunk)]
-    # 1) Prefer sentences that mention both the focus and a time unit
+    if not sentences:
+        return ""
+
+    if focus_keyword:
+        fk = focus_keyword.lower()
+        # prefer sentence with keyword + time unit
+        for s in sentences:
+            ls = s.lower()
+            if fk in ls and any(u in ls for u in ("day", "days", "month", "months", "year", "years")):
+                return s.strip()
+        for s in sentences:
+            if fk in s.lower():
+                return s.strip()
+
+    # sensible generic fallback: take the first policy-like sentence
     for s in sentences:
-        if focus_keyword in s.lower() and any(u in s.lower() for u in ("month", "year")):
+        if any(w in s.lower() for w in ("shall", "will", "grace period", "waiting period", "covered", "excluded")):
             return s.strip()
-    # 2) Otherwise, fallback to first sentence with the focus keyword
-    for s in sentences:
-        if focus_keyword in s.lower():
-            return s.strip()
-    # 3) Last resort: first sentence at all
-    return sentences[0].strip() if sentences else ""
+    return sentences[0].strip()
+
 # ==================== Pydantic Models ====================
 class QueryRequest(BaseModel):
     query: str
@@ -336,16 +349,28 @@ class SemanticSearchEngine:
     def __init__(self):
         self.model = SentenceTransformer(Config.EMBEDDING_MODEL)
         self.index = None
-        self.chunks = []
-        self.meta = []
+        self.chunks: List[str] = []
+        self.meta: List[Dict[str, Any]] = []
 
-    def build_index(self, docs: Dict[str,List[str]]):
+    def _persist(self):
+        # optional persistence; only if FAISS and path is provided
+        if FAISS_AVAILABLE and Config.FAISS_INDEX_PATH:
+            faiss.write_index(self.index, Config.FAISS_INDEX_PATH)
+            side = {
+                "chunks": self.chunks,
+                "meta": self.meta,
+            }
+            with open(Config.FAISS_INDEX_PATH + ".json", "w", encoding="utf-8") as f:
+                json.dump(side, f)
+
+    def build_index(self, docs: Dict[str, List[str]]):
         all_chunks, meta = [], []
         for did, chs in docs.items():
             for i, c in enumerate(chs):
                 all_chunks.append(c)
-                meta.append({'doc_id':did,'chunk_id':i,'text':c})
-        if not all_chunks: return
+                meta.append({'doc_id': did, 'chunk_id': i, 'text': c})
+        if not all_chunks:
+            return
         embs = self.model.encode(all_chunks)
         if FAISS_AVAILABLE:
             embs = np.ascontiguousarray(embs.astype('float32'))
@@ -353,27 +378,68 @@ class SemanticSearchEngine:
             self.index = faiss.IndexFlatIP(embs.shape[1])
             self.index.add(embs)
         else:
-            self.index = embs
+            self.index = embs  # ndarray
         self.chunks, self.meta = all_chunks, meta
+        self._persist()
 
-    def search(self, query: str, k: int) -> List[Dict[str,Any]]:
-        if self.index is None: return []
-        qemb = self.model.encode([query])
+    def search(self, query: str, top_k: int) -> List[Dict[str, Any]]:
+        if not self.chunks:
+            return []
+        
+        query_emb = self.model.encode([query])
+        
         if FAISS_AVAILABLE:
-            qemb = np.ascontiguousarray(qemb.astype('float32'))
-            faiss.normalize_L2(qemb)
-            scores, idxs = self.index.search(qemb, k)
-            res = []
-            for s, i in zip(scores[0], idxs[0]):
-                if s >= Config.SIMILARITY_THRESHOLD:
-                    m = self.meta[i]
-                    res.append({**m,'similarity_score':float(s)})
-            return res
+            query_emb = np.ascontiguousarray(query_emb.astype('float32'))
+            faiss.normalize_L2(query_emb)
+            scores, indices = self.index.search(query_emb, top_k)
+            results = []
+            for i, (score, idx) in enumerate(zip(scores[0], indices[0])):
+                if idx < len(self.meta) and score >= Config.SIMILARITY_THRESHOLD:
+                    result = self.meta[idx].copy()
+                    result['score'] = float(score)
+                    results.append(result)
+            return results
         else:
-            sims = cosine_similarity(qemb, self.index)[0]
-            idxs = sims.argsort()[::-1][:k]
-            return [{'text':self.chunks[i],'doc_id':self.meta[i]['doc_id'],'chunk_id':self.meta[i]['chunk_id'],'similarity_score':float(sims[i])}
-                    for i in idxs if sims[i]>=Config.SIMILARITY_THRESHOLD]
+            # Fallback using sklearn
+            similarities = cosine_similarity(query_emb, self.index)[0]
+            top_indices = similarities.argsort()[-top_k:][::-1]
+            results = []
+            for idx in top_indices:
+                if similarities[idx] >= Config.SIMILARITY_THRESHOLD:
+                    result = self.meta[idx].copy()
+                    result['score'] = float(similarities[idx])
+                    results.append(result)
+            return results
+
+    def add_to_index(self, docs: Dict[str, List[str]]) -> int:
+        """Append new docs to the existing global index (creating it if missing)."""
+        new_chunks, new_meta = [], []
+        for did, chs in docs.items():
+            start = sum(1 for m in self.meta if m['doc_id'] == did)
+            for i, c in enumerate(chs):
+                new_chunks.append(c)
+                new_meta.append({'doc_id': did, 'chunk_id': start + i, 'text': c})
+        if not new_chunks:
+            return 0
+
+        embs = self.model.encode(new_chunks)
+        if FAISS_AVAILABLE:
+            embs = np.ascontiguousarray(embs.astype('float32'))
+            faiss.normalize_L2(embs)
+            if self.index is None:
+                self.index = faiss.IndexFlatIP(embs.shape[1])
+            self.index.add(embs)
+        else:
+            if self.index is None:
+                self.index = embs
+            else:
+                self.index = np.vstack([self.index, embs])
+
+        self.chunks.extend(new_chunks)
+        self.meta.extend(new_meta)
+        self._persist()
+        return len(new_chunks)
+    
 
 # LLMDecisionEngine
 import google.generativeai as genai
@@ -386,6 +452,35 @@ class LLMDecisionEngine:
             model_name=Config.GEMINI_MODEL,
             generation_config={"response_mime_type":"application/json"}
         )
+
+    def create_decision_prompt(self, info: Dict[str, Any], chunks: List[dict]) -> str:
+        chunk_data = "\n".join(f"--- {c['doc_id']}:{c['chunk_id']} ---\n{c['text']}"
+                            for c in chunks)
+        
+        return f"""
+    You are an insurance claims processor. Based on the policy excerpts and user information, make a claim decision.
+
+    User Information:
+    - Age: {info.get('age', 'Not specified')}
+    - Gender: {info.get('gender', 'Not specified')}
+    - Procedure: {info.get('procedure', 'Not specified')}
+    - Location: {info.get('location', 'Not specified')}
+    - Policy Duration: {info.get('policy_duration', 'Not specified')}
+
+    Policy Excerpts:
+    {chunk_data}
+
+    Respond with JSON:
+    {{
+        "decision": "approved" | "rejected",
+        "amount": <number or null>,
+        "confidence": "high" | "medium" | "low",
+        "justification": "<reason>",
+        "referenced_clauses": ["<doc_id:chunk_id>", ...],
+        "waiting_period_status": "applicable" | "not_applicable" | "expired",
+        "additional_notes": "<any extra info>"
+    }}
+    """
 
 
     def create_information_prompt(self, query: str, chunks: List[dict]) -> str:
@@ -486,6 +581,8 @@ class LLMDecisionEngine:
             return "The policy document does not specify this information."
 
 # DocumentQuerySystem
+from threading import Lock
+
 class DocumentQuerySystem:
     def __init__(self):
         self.dp = DocumentProcessor()
@@ -493,13 +590,31 @@ class DocumentQuerySystem:
         self.ss = SemanticSearchEngine()
         self.de = LLMDecisionEngine()
         self.inited = False
+        self._lock = Lock()
+        self.doc_registry: set[str] = set()  # to avoid re-ingesting same URL
 
     def initialize(self) -> bool:
         docs = self.dp.process_documents(Config.DOCUMENT_URLS)
-        if not docs: return False
+        if not docs:
+            return False
         self.ss.build_index(docs)
+        self.doc_registry.update(Config.DOCUMENT_URLS)
         self.inited = True
         return True
+
+    def ingest_documents(self, urls: List[str]) -> int:
+        """Download → chunk → embed → append to global index. Skips URLs already ingested."""
+        if not urls:
+            return 0
+        with self._lock:
+            new_urls = [u for u in urls if u not in self.doc_registry]
+            if not new_urls:
+                return 0
+            docs = self.dp.process_documents(new_urls)
+            added = self.ss.add_to_index(docs)
+            self.doc_registry.update(new_urls)
+            self.inited = True
+            return added
 
     def process_query(self, q: str) -> Tuple[Dict[str, Any], int]:
         """
@@ -578,27 +693,29 @@ class DocumentQuerySystem:
         }, status.HTTP_200_OK)
     
 
-    def answer_questions(self, questions: list) -> dict:   
-    
+    def answer_questions(self, documents: Optional[Union[str, List[str]]], questions: List[str]) -> Tuple[Dict[str, Any], int]:
         if not self.inited:
             return {"error": "Service not initialized"}, 503
-        
-        answers = []
-        
-        for q in questions:
 
-            # 1) Retrieve all relevant chunks (you said these are perfect already)
+        # If new docs were sent with this request, ingest them now (incremental)
+        if documents:
+            urls = [documents] if isinstance(documents, str) else list(documents)
+            self.ingest_documents(urls)
+
+        answers = []
+        for q in questions:
             hits = self.ss.search(q, Config.TOP_K_RETRIEVAL)
             if not hits:
-                return {"error": "No relevant information found"}, 404
+                answers.append("The policy document does not specify this information.")
+                continue
+            # Current code tries to get 'summary' from direct answer
+            info = self.de.answer_question_direct(q, hits)
+            answers.append(info.get("summary") or "The policy document does not specify this information.")
 
-            # 2) Ask the LLM for a clean summary
-            info = self.de.make_information(q, hits)
-            answers.append(info.get("summary"))
-
-            # 3) Return exactly the summary + the chunks that produced it
-            return (
-                {"answer": answers}, status.HTTP_200_OK)
+            # Should be:
+            answer = self.de.answer_question_direct(q, hits)
+            answers.append(answer if answer else "The policy document does not specify this information.")
+    
 
 # ==================== App Startup ====================
 @app.on_event('startup')
@@ -668,7 +785,9 @@ def ingest(cur=Depends(get_current_user)):
 #     return {'message':'Uploaded documents ingested successfully.'}
 
 @app.post('/employee/query')
-def employee_query(req: QueryRequest):
+def employee_query(req: QueryRequest, cur=Depends(get_current_user)):  # Add this dependency
+    if cur['role'] not in ['employee', 'admin']: 
+        raise HTTPException(403, 'Employee access required')
     result, status_code = system.process_query(req.query)
     if status_code != 0:
         # missing fields or bad request
@@ -686,796 +805,42 @@ def emp_info(req: QueryRequest, cur=Depends(get_current_user)):
     if st!=0: raise HTTPException(400,res)
     return res
 
-@app.post('/hackrx/run')
-def emp_ans(req: QueryRequest, cur=Depends(get_current_user)):
-    if cur['role']!='employee': raise HTTPException(403,'Employee required')
-    res, st = system.answer_questions(req.query['questions'])
-    if st!=0: raise HTTPException(400,res)
+from fastapi import Request
+
+class HackrxRunIn(BaseModel):
+    documents: Optional[Union[str, List[str]]] = None
+    questions: List[str]
+
+class HackrxRunOut(BaseModel):
+    answers: List[str]
+
+from fastapi import Security
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+
+bearer_scheme = HTTPBearer(auto_error=False)
+
+from fastapi import Header
+
+def require_webhook_bearer(authorization: Optional[str] = Header(None)):
+    api_key = os.getenv("WEBHOOK_API_KEY")
+    if not api_key:  # open route in local dev if you prefer
+        return
+    if not authorization:
+        raise HTTPException(status_code=401, detail="Invalid or missing Bearer token")
+    scheme, _, token = authorization.partition(" ")
+    if scheme.lower() != "bearer" or token != api_key:
+        raise HTTPException(status_code=401, detail="Invalid or missing Bearer token")
+
+@app.post('/hackrx/run', response_model=HackrxRunOut, tags=['Webhook'])
+def hackrx_run(payload: HackrxRunIn, _=Depends(require_webhook_bearer)):
+    res, st = system.answer_questions(payload.documents, payload.questions)
+    if st != status.HTTP_200_OK:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, res)
     return res
 
+@app.middleware("http")
+async def _debug_auth(request, call_next):
+    if request.url.path == "/hackrx/run":
+        print("AUTH HEADER:", request.headers.get("authorization"))
+    return await call_next(request)
 
-
-
-
-
-
-
-# ==============================================================================
-# main.py: AI Insurance Agent with FastAPI, Gemini, and FAISS
-# ==============================================================================
-
-# ========== CORE IMPORTS ==========
-# import os
-# import json
-# import re
-# import warnings
-# from io import BytesIO
-# from typing import List, Dict, Any, Tuple
-
-# # ========== THIRD-PARTY IMPORTS ==========
-# import certifi
-# import google.generativeai as genai
-# import nltk
-# import numpy as np
-# import pandas as pd
-# import PyPDF2
-# import requests
-# import spacy
-# from fastapi import FastAPI, Depends, HTTPException, status
-# from fastapi.security import HTTPBasic, HTTPBasicCredentials
-# from pydantic import BaseModel, Field
-# from pydantic import BaseSettings
-
-# # --- Resilient FAISS / sklearn import ---
-# try:
-#     import faiss
-#     FAISS_AVAILABLE = True
-#     print("🔍 Using FAISS for high-performance search")
-# except ImportError:
-#     from sklearn.metrics.pairwise import cosine_similarity
-#     FAISS_AVAILABLE = False
-#     print("⚠️ FAISS not found; falling back to scikit-learn (slower)")
-
-# # ========== INITIAL SETUP ==========
-# warnings.filterwarnings('ignore')
-# nltk.download('punkt', quiet=True)
-# os.environ['SSL_CERT_FILE'] = certifi.where()
-
-# # ==============================================================================
-# # CONFIGURATION & MODELS
-# # ==============================================================================
-
-# class AppConfig(BaseSettings):
-#     """Load settings from .env, with validation & defaults."""
-#     GOOGLE_API_KEY: str
-#     ADMIN_USERNAME: str = "admin"
-#     ADMIN_PASSWORD: str = "admin_pass"
-#     EMPLOYEE_USERNAME: str = "employee"
-#     EMPLOYEE_PASSWORD: str = "employee_pass"
-#     EMBEDDING_MODEL: str = "models/text-embedding-004"
-#     GENERATIVE_MODEL: str = "gemini-1.5-flash-latest"
-#     DOCUMENT_URLS: List[str] = [
-#         "https://hackrx.blob.core.windows.net/assets/hackrx_6/policies/BAJHLIP23020V012223.pdf?sv=2023-01-03&st=2025-07-30T06%3A46%3A49Z&se=2025-09-01T06%3A46%3A00Z&sr=c&sp=rl&sig=9szykRKdGYj0BVm1skP%2BX8N9%2FRENEn2k7MQPUp33jyQ%3D",
-#         "https://hackrx.blob.core.windows.net/assets/hackrx_6/policies/CHOTGDP23004V012223.pdf?sv=2023-01-03&st=2025-07-30T06%3A46%3A49Z&se=2025-09-01T06%3A46%3A00Z&sr=c&sp=rl&sig=9szykRKdGYj0BVm1skP%2BX8N9%2FRENEn2k7MQPUp33jyQ%3D",
-#         "https://hackrx.blob.core.windows.net/assets/hackrx_6/policies/EDLHLGA23009V012223.pdf?sv=2023-01-03&st=2025-07-30T06%3A46%3A49Z&se=2025-09-01T06%3A46%3A00Z&sr=c&sp=rl&sig=9szykRKdGYj0BVm1skP%2BX8N9%2FRENEn2k7MQPUp33jyQ%3D",
-#         "https://hackrx.blob.core.windows.net/assets/hackrx_6/policies/HDFHLIP23024V072223.pdf?sv=2023-01-03&st=2025-07-30T06%3A46%3A49Z&se=2025-09-01T06%3A46%3A00Z&sr=c&sp=rl&sig=9szykRKdGYj0BVm1skP%2BX8N9%2FRENEn2k7MQPUp33jyQ%3D",
-#         "https://hackrx.blob.core.windows.net/assets/hackrx_6/policies/ICIHLIP22012V012223.pdf?sv=2023-01-03&st=2025-07-30T06%3A46%3A49Z&se=2025-09-01T06%3A46%3A00Z&sr=c&sp=rl&sig=9szykRKdGYj0BVm1skP%2BX8N9%2FRENEn2k7MQPUp33jyQ%3D",
-#     ]
-#     CHUNK_SIZE: int = 400
-#     CHUNK_OVERLAP: int = 50
-#     TOP_K_RETRIEVAL: int = 5
-#     SIMILARITY_THRESHOLD: float = 0.7
-
-#     class Config:
-#         env_file = ".env"
-
-
-# try:
-#     config = AppConfig()
-# except Exception as e:
-#     raise RuntimeError(f"❌ Could not load configuration (.env): {e}")
-
-# if not config.GOOGLE_API_KEY or "your_key" in config.GOOGLE_API_KEY:
-#     raise RuntimeError("❌ GOOGLE_API_KEY is missing or invalid in .env")
-
-# genai.configure(api_key=config.GOOGLE_API_KEY)
-
-
-# class QueryIn(BaseModel):
-#     query: str = Field(..., example="A 45 year old male needs knee surgery. Is it covered?")
-
-
-# class UserCreate(BaseModel):
-#     username: str
-#     password: str
-#     role: str = Field(..., regex="^(admin|employee)$")
-
-
-# # ==============================================================================
-# # CORE LOGIC CLASSES
-# # ==============================================================================
-
-# class DocumentProcessor:
-#     """Download PDFs, extract text, clean & chunk into passages."""
-#     def download_pdf(self, url: str) -> bytes | None:
-#         try:
-#             r = requests.get(url, timeout=30, verify=certifi.where())
-#             r.raise_for_status()
-#             return r.content
-#         except Exception as e:
-#             print(f"❌ Download error ({url}): {e}")
-#             return None
-
-#     def extract_text(self, content: bytes) -> str:
-#         try:
-#             reader = PyPDF2.PdfReader(BytesIO(content))
-#             return "\n".join(p.extract_text() or "" for p in reader.pages)
-#         except Exception as e:
-#             print(f"❌ PDF parse error: {e}")
-#             return ""
-
-#     def clean_text(self, text: str) -> str:
-#         return re.sub(r"\s+", " ", text).strip()
-
-#     def chunk_text(self, text: str) -> List[str]:
-#         sentences = nltk.sent_tokenize(text)
-#         chunks, buf = [], ""
-#         for s in sentences:
-#             if len((buf + " " + s).split()) <= config.CHUNK_SIZE:
-#                 buf += " " + s
-#             else:
-#                 if len(buf.split()) >= 50:
-#                     chunks.append(buf.strip())
-#                 buf = s
-#         if len(buf.split()) >= 50:
-#             chunks.append(buf.strip())
-#         return chunks
-
-#     def process_documents(self, urls: List[str]) -> Dict[str, List[str]]:
-#         all_chunks: Dict[str, List[str]] = {}
-#         for i, url in enumerate(urls):
-#             content = self.download_pdf(url)
-#             if not content:
-#                 continue
-#             text = self.extract_text(content)
-#             cid = f"doc_{i+1}"
-#             all_chunks[cid] = self.chunk_text(self.clean_text(text))
-#         return all_chunks
-
-
-# class QueryParser:
-#     """Extracts structured fields from a free-text query."""
-#     def __init__(self):
-#         try:
-#             self.nlp = spacy.load("en_core_web_sm")
-#         except:
-#             self.nlp = None
-#             print("⚠️ spaCy model not found. Run `python -m spacy download en_core_web_sm`")
-#         self.age_re = re.compile(r"\b(\d+)\s*year", re.IGNORECASE)
-#         self.gender_re = re.compile(r"\b(male|female|m|f)\b", re.IGNORECASE)
-#         self.proc_re = re.compile(r"\b([A-Za-z\- ]+?(?:surgery|treatment|procedure|therapy))\b", re.IGNORECASE)
-#         self.policy_re = re.compile(r"(\d+)\s*(month|year|day)s?", re.IGNORECASE)
-
-#     def parse(self, q: str) -> Dict[str, Any]:
-#         age = gender = procedure = location = policy_duration = None
-
-#         m = self.age_re.search(q)
-#         if m:
-#             age = int(m.group(1))
-
-#         m = self.gender_re.search(q)
-#         if m:
-#             g = m.group(1).lower()
-#             gender = "Male" if g in ("male", "m") else "Female"
-
-#         m = self.proc_re.search(q)
-#         if m:
-#             procedure = m.group(1).strip()
-
-#         if self.nlp:
-#             doc = self.nlp(q)
-#             for ent in doc.ents:
-#                 if ent.label_ in ("GPE", "LOC"):
-#                     location = ent.text
-#                     break
-
-#         m = self.policy_re.search(q)
-#         if m:
-#             policy_duration = {"value": int(m.group(1)), "unit": m.group(2)}
-
-#         return {
-#             "original_query": q,
-#             "age": age,
-#             "gender": gender,
-#             "procedure": procedure,
-#             "location": location,
-#             "policy_duration": policy_duration,
-#         }
-
-
-# class SemanticSearchEngine:
-#     """Embeds with Google, indexes with FAISS (or falls back)."""
-#     def __init__(self):
-#         self.index = None
-#         self.metadata: List[Dict[str, Any]] = []
-
-#     def build_index(self, docs: Dict[str, List[str]]):
-#         texts = [chunk for chunks in docs.values() for chunk in chunks]
-#         self.metadata = [
-#             {"doc_id": doc_id, "chunk_id": idx, "text": chunk}
-#             for doc_id, chunks in docs.items()
-#             for idx, chunk in enumerate(chunks)
-#         ]
-#         if not texts:
-#             return
-
-#         # embed documents
-#         resp = genai.embed_content(
-#             model=config.EMBEDDING_MODEL,
-#             content=texts,
-#             task_type="retrieval_document"
-#         )
-#         embs = np.ascontiguousarray(
-#             pd.DataFrame(resp["embedding"]).to_numpy(dtype="float32")
-#         )
-
-#         if FAISS_AVAILABLE:
-#             faiss.normalize_L2(embs)
-#             self.index = faiss.IndexFlatIP(embs.shape[1])
-#             self.index.add(embs)
-#         else:
-#             norms = np.linalg.norm(embs, axis=1, keepdims=True)
-#             self.index = embs / norms
-
-#     def search(self, query: str) -> List[Dict[str, Any]]:
-#         if self.index is None:
-#             return []
-
-#         # embed query
-#         resp = genai.embed_content(
-#             model=config.EMBEDDING_MODEL,
-#             content=[query],
-#             task_type="retrieval_query"
-#         )
-#         qemb = np.ascontiguousarray(
-#             pd.DataFrame(resp["embedding"]).to_numpy(dtype="float32")
-#         )
-
-#         if FAISS_AVAILABLE:
-#             faiss.normalize_L2(qemb)
-#             scores, idxs = self.index.search(qemb, config.TOP_K_RETRIEVAL)
-#             scores, idxs = scores[0], idxs[0]
-#         else:
-#             faiss.normalize_L2(qemb)
-#             sims = (self.index @ qemb.T).flatten()
-#             idxs = np.argsort(sims)[::-1][: config.TOP_K_RETRIEVAL]
-#             scores = sims[idxs]
-
-#         results = []
-#         for s, i in zip(scores, idxs):
-#             if s >= config.SIMILARITY_THRESHOLD:
-#                 m = self.metadata[i]
-#                 results.append({**m, "score": float(s)})
-#         return results
-
-
-# class LLMDecisionEngine:
-#     """Uses Gemini with JSON Mode for reliable structured output."""
-#     def __init__(self):
-#         self.model = genai.GenerativeModel(
-#             model_name=config.GENERATIVE_MODEL,
-#             generation_config={"response_mime_type": "application/json"}
-#         )
-
-#     def _generate_json(self, prompt: str) -> Dict[str, Any]:
-#         resp = self.model.generate_content(prompt)
-#         try:
-#             return json.loads(resp.text)
-#         except Exception as e:
-#             return {"error": f"JSON parse failed: {e}"}
-
-#     def make_decision(self, info: Dict[str, Any], chunks: List[Dict[str, Any]]) -> Dict[str, Any]:
-#         ctx = "\n---\n".join(f"{c['doc_id']}: {c['text']}" for c in chunks)
-#         prompt = (
-#             f"You are an insurance policy analyst.\n"
-#             f"USER INFO: {json.dumps(info)}\n"
-#             f"POLICY CLAUSES:\n{ctx or 'None'}\n"
-#             f"Respond with JSON schema:\n"
-#             f'{{"decision":"approved"|"rejected","justification":str,"referenced_docs":[str]}}'
-#         )
-#         return self._generate_json(prompt)
-
-#     def get_info(self, query: str, chunks: List[Dict[str, Any]]) -> Dict[str, Any]:
-#         ctx = "\n---\n".join(f"{c['doc_id']}: {c['text']}" for c in chunks)
-#         prompt = (
-#             f"You are an insurance assistant.\n"
-#             f"USER QUERY: {query}\n"
-#             f"POLICY CLAUSES:\n{ctx or 'None'}\n"
-#             f"Respond with JSON schema:\n"
-#             f'{{"summary":str,"top_3_chunks":[str]}}'
-#         )
-#         return self._generate_json(prompt)
-
-
-# class DocumentQuerySystem:
-#     """Orchestrates ingestion, indexing, and RAG operations."""
-#     def __init__(self):
-#         self.processor = DocumentProcessor()
-#         self.parser = QueryParser()
-#         self.searcher = SemanticSearchEngine()
-#         self.decider = LLMDecisionEngine()
-#         self.initialized = False
-
-#     def initialize(self) -> bool:
-#         docs = self.processor.process_documents(config.DOCUMENT_URLS)
-#         if not docs:
-#             return False
-#         self.searcher.build_index(docs)
-#         self.initialized = True
-#         return True
-
-#     def process_query(self, query: str) -> Tuple[Dict[str, Any], int]:
-#         if not self.initialized:
-#             return {"error": "Service not initialized"}, status.HTTP_503_SERVICE_UNAVAILABLE
-
-#         info = self.parser.parse(query)
-#         # ensure no key fields missing
-#         for k, v in info.items():
-#             if k != "original_query" and v is None:
-#                 return {"error": f"Missing field: {k}"}, status.HTTP_400_BAD_REQUEST
-
-#         hits = self.searcher.search(query)
-#         decision = self.decider.make_decision(info, hits)
-#         return {"query_info": info, "decision": decision}, status.HTTP_200_OK
-
-#     def process_query_info(self, query: str) -> Tuple[Dict[str, Any], int]:
-#         if not self.initialized:
-#             return {"error": "Service not initialized"}, status.HTTP_503_SERVICE_UNAVAILABLE
-
-#         hits = self.searcher.search(query)
-#         if not hits:
-#             return {"error": "No relevant information"}, status.HTTP_404_NOT_FOUND
-
-#         summary = self.decider.get_info(query, hits)
-#         return summary, status.HTTP_200_OK
-
-
-# # ==============================================================================
-# # FASTAPI APP & ENDPOINTS
-# # ==============================================================================
-
-# app = FastAPI(title="AI Insurance Agent", version="2.0.0")
-# system = DocumentQuerySystem()
-# security = HTTPBasic()
-
-# # In-memory user DB
-# users_db = {
-#     config.ADMIN_USERNAME:    {"password": config.ADMIN_PASSWORD,    "role": "admin"},
-#     config.EMPLOYEE_USERNAME: {"password": config.EMPLOYEE_PASSWORD, "role": "employee"},
-# }
-
-
-# def get_current_user(creds: HTTPBasicCredentials = Depends(security)):
-#     u = users_db.get(creds.username)
-#     if not u or u["password"] != creds.password:
-#         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid credentials")
-#     return {"username": creds.username, "role": u["role"]}
-
-
-# def admin_required(user: Dict[str, Any] = Depends(get_current_user)):
-#     if user["role"] != "admin":
-#         raise HTTPException(status.HTTP_403_FORBIDDEN, "Admin access required")
-#     return user
-
-
-# def employee_required(user: Dict[str, Any] = Depends(get_current_user)):
-#     if user["role"] not in ("admin", "employee"):
-#         raise HTTPException(status.HTTP_403_FORBIDDEN, "Employee access required")
-#     return user
-
-
-# @app.on_event("startup")
-# def startup():
-#     if not system.initialize():
-#         print("❌ WARNING: Document ingestion failed at startup")
-
-
-# @app.post("/auth/login", tags=["Auth"])
-# def login(user=Depends(get_current_user)):
-#     return {"message": f"{user['username']} logged in", "role": user["role"]}
-
-
-# @app.post("/auth/logout", tags=["Auth"])
-# def logout():
-#     return {"message": "Logged out"}
-
-
-# @app.post("/admin/users", dependencies=[Depends(admin_required)], status_code=201, tags=["Admin"])
-# def create_user(u: UserCreate):
-#     if u.username in users_db:
-#         raise HTTPException(400, "Username exists")
-#     users_db[u.username] = {"password": u.password, "role": u.role}
-#     return {"username": u.username, "role": u.role}
-
-
-# @app.get("/admin/users", dependencies=[Depends(admin_required)], tags=["Admin"])
-# def list_users():
-#     return [{"username": k, "role": v["role"]} for k, v in users_db.items()]
-
-
-# @app.post("/admin/ingest", dependencies=[Depends(admin_required)], tags=["Admin"])
-# def ingest():
-#     ok = system.initialize()
-#     if not ok:
-#         raise HTTPException(500, "Ingestion failed")
-#     return {"message": "Re-ingestion complete"}
-
-
-# @app.post("/employee/query", dependencies=[Depends(employee_required)], tags=["Employee"])
-# def employee_query(q: QueryIn):
-#     res, code = system.process_query(q.query)
-#     if code != status.HTTP_200_OK:
-#         raise HTTPException(code, res)
-#     return res
-
-
-# @app.post("/employee/info", dependencies=[Depends(employee_required)], tags=["Employee"])
-# def employee_info(q: QueryIn):
-#     res, code = system.process_query_info(q.query)
-#     if code != status.HTTP_200_OK:
-#         raise HTTPException(code, res)
-#     return res
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-# import os
-# import json
-# import re
-# import warnings
-# from io import BytesIO
-# from typing import List, Dict, Any, Tuple
-
-# from dotenv import load_dotenv
-# import certifi
-# import requests
-# import pandas as pd
-# import nltk
-# from sentence_transformers import SentenceTransformer
-# import faiss
-# import numpy as np
-# from docx import Document as DocxDocument
-# import PyPDF2
-# import google.generativeai as genai
-# import spacy
-# from word2number import w2n
-# from sklearn.metrics.pairwise import cosine_similarity
-
-# from fastapi import FastAPI, Depends, HTTPException
-# from fastapi.security import HTTPBasic, HTTPBasicCredentials
-# from pydantic import BaseModel, HttpUrl
-
-# # Suppress warnings
-# warnings.filterwarnings('ignore')
-
-# # Ensure SSL certificates are found (macOS)
-# os.environ['SSL_CERT_FILE'] = certifi.where()
-
-# # Download NLTK data (silent failures permitted)
-# nltk.download('punkt', quiet=True)
-# nltk.download('stopwords', quiet=True)
-# load_dotenv()
-# # ========== CONFIGURATION ==========
-
-#     # ========== CONFIGURATION ==========
-# class Config:
-#     GOOGLE_API_KEY = os.getenv('GOOGLE_API_KEY')
-#     # --- UPDATED ---
-#     EMBEDDING_MODEL = 'models/text-embedding-004' 
-#     GENERATIVE_MODEL = 'gemini-1.5-flash-latest' # Using latest for better features
-#     DOCUMENT_URLS = [
-#         "https://hackrx.blob.core.windows.net/assets/hackrx_6/policies/BAJHLIP23020V012223.pdf?sv=2023-01-03&st=2025-07-30T06%3A46%3A49Z&se=2025-09-01T06%3A46%3A00Z&sr=c&sp=rl&sig=9szykRKdGYj0BVm1skP%2BX8N9%2FRENEn2k7MQPUp33jyQ%3D",
-#         "https://hackrx.blob.core.windows.net/assets/hackrx_6/policies/CHOTGDP23004V012223.pdf?sv=2023-01-03&st=2025-07-30T06%3A46%3A49Z&se=2025-09-01T06%3A46%3A00Z&sr=c&sp=rl&sig=9szykRKdGYj0BVm1skP%2BX8N9%2FRENEn2k7MQPUp33jyQ%3D",
-#         "https://hackrx.blob.core.windows.net/assets/hackrx_6/policies/EDLHLGA23009V012223.pdf?sv=2023-01-03&st=2025-07-30T06%3A46%3A49Z&se=2025-09-01T06%3A46%3A00Z&sr=c&sp=rl&sig=9szykRKdGYj0BVm1skP%2BX8N9%2FRENEn2k7MQPUp33jyQ%3D",
-#         "https://hackrx.blob.core.windows.net/assets/hackrx_6/policies/HDFHLIP23024V072223.pdf?sv=2023-01-03&st=2025-07-30T06%3A46%3A49Z&se=2025-09-01T06%3A46%3A00Z&sr=c&sp=rl&sig=9szykRKdGYj0BVm1skP%2BX8N9%2FRENEn2k7MQPUp33jyQ%3D",
-#         "https://hackrx.blob.core.windows.net/assets/hackrx_6/policies/ICIHLIP22012V012223.pdf?sv=2023-01-03&st=2025-07-30T06%3A46%3A49Z&se=2025-09-01T06%3A46%3A00Z&sr=c&sp=rl&sig=9szykRKdGYj0BVm1skP%2BX8N9%2FRENEn2k7MQPUp33jyQ%3D",
-#     ]
-        
-#     CHUNK_SIZE = 500
-#     CHUNK_OVERLAP = 50
-#     TOP_K_RETRIEVAL = 5
-#     SIMILARITY_THRESHOLD = 0.7 # Often a higher threshold works better with stronger embeddings
-    
-
-# # ========== DOCUMENT PROCESSOR ==========
-# class DocumentProcessor:
-#     def download_pdf(self, url: str) -> bytes:
-#         try:
-#             resp = requests.get(url, timeout=30)
-#             resp.raise_for_status()
-#             return resp.content
-#         except Exception:
-#             return None
-
-#     def extract_text_from_pdf(self, content: bytes) -> str:
-#         reader = PyPDF2.PdfReader(BytesIO(content))
-#         return '\n'.join(page.extract_text() or '' for page in reader.pages)
-
-#     def clean_text(self, txt: str) -> str:
-#         txt = re.sub(r'\s+', ' ', txt)
-#         txt = re.sub(r'[^\w\s\.,;:!\?\-\(\)\[\]]', ' ', txt)
-#         return txt.strip()
-
-#     def chunk_text(self, text: str) -> List[str]:
-#         words = text.split()
-#         chunks = []
-#         for i in range(0, len(words), Config.CHUNK_SIZE - Config.CHUNK_OVERLAP):
-#             chunk = ' '.join(words[i:i + Config.CHUNK_SIZE])
-#             if len(chunk) > 50:
-#                 chunks.append(chunk)
-#         return chunks
-
-#     def process_documents(self, urls: List[str]) -> Dict[str, List[str]]:
-#         all_chunks = {}
-#         for idx, url in enumerate(urls, start=1):
-#             content = self.download_pdf(url)
-#             if not content:
-#                 continue
-#             text = self.extract_text_from_pdf(content)
-#             cleaned = self.clean_text(text)
-#             all_chunks[f'doc_{idx}'] = self.chunk_text(cleaned)
-#         return all_chunks
-
-# # ========== QUERY PARSER ==========
-# class QueryParser:
-#     def __init__(self):
-#         try:
-#             self.nlp = spacy.load('en_core_web_sm')
-#         except:
-#             self.nlp = None
-#         self.age_re = re.compile(r'\b(\d+)\s*(?:years?)?', re.IGNORECASE)
-#         self.gender_re = re.compile(r'\b(male|female|they)\b', re.IGNORECASE)
-#         self.proc_re = re.compile(r'\b([A-Za-z\- ]+? (?:surgery|treatment|procedure))\b', re.IGNORECASE)
-#         self.dur_re = re.compile(r'\b(\d+)\s*(?:months?|years?)', re.IGNORECASE)
-
-#     def parse(self, query: str) -> Dict[str, Any]:
-#         info = {'original_query': query}
-#         m = self.age_re.search(query)
-#         info['age'] = int(m.group(1)) if m else None
-#         m = self.gender_re.search(query)
-#         info['gender'] = m.group(1).title() if m else None
-#         m = self.proc_re.search(query)
-#         info['procedure'] = m.group(1) if m else None
-#         m = self.dur_re.search(query)
-#         info['policy_duration'] = {'value': int(m.group(1)), 'unit': 'months'} if m else None
-#         if self.nlp:
-#             doc = self.nlp(query)
-#             for ent in doc.ents:
-#                 if ent.label_ in ('GPE', 'LOC'):
-#                     info['location'] = ent.text
-#                     break
-#         else:
-#             info['location'] = None
-#         return info
-
-# # ========== SEMANTIC SEARCH ==========
-# # ========== SEMANTIC SEARCH (UPGRADED) ==========
-# class SemanticSearchEngine:
-#     def __init__(self):
-#         # The SentenceTransformer model is no longer needed here.
-#         self.index = None
-#         self.metadata = []
-#         # We don't store embeddings directly anymore unless FAISS fails.
-
-#     def build_index(self, docs: Dict[str, List[str]]):
-#         texts_for_embedding = []
-#         for doc_id, chunks in docs.items():
-#             for i, chunk_text in enumerate(chunks):
-#                 texts_for_embedding.append(chunk_text)
-#                 self.metadata.append({'doc_id': doc_id, 'chunk_id': i, 'text': chunk_text})
-
-#         if not texts_for_embedding:
-#             print("Warning: No text chunks found to build the index.")
-#             return
-
-#         print(f"Generating embeddings for {len(texts_for_embedding)} chunks...")
-#         # Embed content in batches for reliability
-#         response = genai.embed_content(
-#             model=Config.EMBEDDING_MODEL,
-#             content=texts_for_embedding,
-#             task_type="retrieval_document" # Important for RAG
-#         )
-#         embeddings = response['embedding']
-        
-#         df = pd.DataFrame(embeddings)
-#         embs_array = np.ascontiguousarray(df.to_numpy(dtype='float32'))
-
-#         faiss.normalize_L2(embs_array)
-#         dim = embs_array.shape[1]
-#         self.index = faiss.IndexFlatIP(dim)
-#         self.index.add(embs_array.astype('float32'))
-#         print("FAISS index built successfully.")
-
-#     def search(self, query: str) -> List[Dict[str, Any]]:
-#         if self.index is None:
-#             return []
-
-#         # Embed the query
-#         response = genai.embed_content(
-#             model=Config.EMBEDDING_MODEL,
-#             content=query,
-#             task_type="retrieval_query" # Important for RAG
-#         )
-#         query_embedding = response['embedding']
-
-#         qemb = np.ascontiguousarray(pd.DataFrame([query_embedding]).to_numpy(dtype='float32'))
-    
-#         faiss.normalize_L2(qemb)
-        
-#         scores, idxs = self.index.search(qemb.astype('float32'), Config.TOP_K_RETRIEVAL)
-        
-#         results = []
-#         for score, idx in zip(scores[0], idxs[0]):
-#             if score > Config.SIMILARITY_THRESHOLD:
-#                 results.append({
-#                     'score': float(score),
-#                     **self.metadata[idx]
-#                 })
-#         return results
-# # ========== LLM ENGINE ==========
-# class LLMDecisionEngine:
-#     def __init__(self):
-#         genai.configure(api_key=Config.GOOGLE_API_KEY)
-#         self.model = genai.GenerativeModel(
-#             model_name=Config.GENERATIVE_MODEL,
-#             # --- ADDED: Tell the model its output MUST be JSON ---
-#             generation_config={"response_mime_type": "application/json"}
-#         )
-#     def make_decision(self, info: Dict[str, Any], chunks: List[Dict[str, Any]]) -> Dict[str, Any]:
-#         prompt = f"You are an insurance policy analyst.\nQUERY INFO: {info}\n\n"
-#         prompt += "RELEVANT CLAUSES:\n"
-#         for i, c in enumerate(chunks, 1):
-#             prompt += f"--- Clause {i} from {c['doc_id']} ---\n{c['text']}\n"
-#         prompt += "\nRespond with JSON {decision, amount, confidence, justification, referenced_clauses, waiting_period_status, additional_notes}."
-
-#         resp = self.model.generate_content(prompt)
-#         m = re.search(r'\{.*?\}', resp.text, re.DOTALL)
-#         if m:
-#             return json.loads(m.group())
-#         return {'decision': 'rejected', 'justification': resp.text}
-
-# # ========== SYSTEM ORCHESTRATOR ==========
-# class DocumentQuerySystem:
-#     def __init__(self):
-#         self.processor = DocumentProcessor()
-#         self.parser = QueryParser()
-#         self.searcher = SemanticSearchEngine()
-#         self.decisioner = LLMDecisionEngine()
-#         self.initialized = False
-
-#     def initialize(self) -> bool:
-#         docs = self.processor.process_documents(Config.DOCUMENT_URLS)
-#         if not docs:
-#             return False
-#         self.searcher.build_index(docs)
-#         self.initialized = True
-#         return True
-
-#     def process_query(self, query: str) -> Tuple[Any, int]:
-#         if not self.initialized:
-#             return {'error': 'Uninitialized'}, 1
-#         info = self.parser.parse(query)
-#         missing = [k for k in ('age','gender','procedure','location','policy_duration') if info.get(k) is None]
-#         if missing:
-#             return missing, 1
-#         chunks = self.searcher.search(query)
-#         decision = self.decisioner.make_decision(info, chunks)
-#         return {'query_info': info, 'decision': decision, 'relevant_chunks': len(chunks)}, 0
-
-#     def process_query_info(self, query: str) -> Tuple[Any, int]:
-#         if not self.initialized:
-#             return {'error': 'Uninitialized'}, 1
-#         chunks = self.searcher.search(query)
-#         if not chunks:
-#             return {'error': 'No relevant info'}, 1
-#         return {'query': query, 'relevant_info': [c['text'] for c in chunks[:3]]}, 0
-
-# # ========== FASTAPI SETUP ==========
-# app = FastAPI()
-# security = HTTPBasic()
-
-# users = {
-#     os.getenv('ADMIN_USERNAME'): {'password': os.getenv('ADMIN_PASSWORD'), 'role': 'admin'},
-#     os.getenv('EMPLOYEE_USERNAME'): {'password': os.getenv('EMPLOYEE_PASSWORD'), 'role': 'employee'}
-# }
-
-# class Credentials(BaseModel):
-#     username: str
-#     password: str
-#     role: str
-
-# class QueryIn(BaseModel):
-#     query: str
-
-# # Auth dependencies
-# def get_current_user(creds: HTTPBasicCredentials = Depends(security)):
-#     u = users.get(creds.username)
-#     if not u or creds.password != u['password']:
-#         raise HTTPException(401, 'Invalid credentials')
-#     return {'username': creds.username, 'role': u['role']}
-
-# def admin_required(user=Depends(get_current_user)):
-#     if user['role'] != 'admin':
-#         raise HTTPException(403, 'Admin only')
-#     return user
-
-# def employee_required(user=Depends(get_current_user)):
-#     if user['role'] != 'employee':
-#         raise HTTPException(403, 'Employee only')
-#     return user
-
-# # Initialize system on startup
-# system = DocumentQuerySystem()
-# @app.on_event('startup')
-# def init_system():
-#     if not system.initialize():
-#         raise RuntimeError('Initialization failed')
-
-# # Authentication
-# @app.post('/auth/login')
-# def login(user=Depends(get_current_user)):
-#     return {'msg': f"{user['role'].capitalize()} login successful"}
-
-# @app.post('/auth/logout')
-# def logout():
-#     return {'msg': 'Logged out'}
-
-# # User management (Admin only)
-# @app.post('/admin/users', dependencies=[Depends(admin_required)])
-# def create_user(creds: Credentials):
-#     users[creds.username] = {'password': creds.password, 'role': creds.role}
-#     return {'msg': 'User created'}
-
-# @app.get('/admin/users', dependencies=[Depends(admin_required)])
-# def list_users():
-#     return [{'username': u, 'role': v['role']} for u, v in users.items()]
-
-# # Ingestion endpoint
-# @app.post('/admin/ingest', dependencies=[Depends(admin_required)])
-# def ingest():
-#     if not system.initialize():
-#         raise HTTPException(500, 'Ingestion failed')
-#     return {'msg': 'Ingested', 'indexed': len(Config.DOCUMENT_URLS)}
-
-# # Employee endpoints
-# @app.post('/employee/query', dependencies=[Depends(employee_required)])
-# def employee_query(q: QueryIn):
-#     result, status = system.process_query(q.query)
-#     if status == 1:
-#         raise HTTPException(status_code=400, detail={'missing_fields': result})
-#     return result
-
-# @app.post('/employee/info', dependencies=[Depends(employee_required)])
-# def employee_info(q: QueryIn):
-#     result, status = system.process_query_info(q.query)
-#     if status == 1:
-#         raise HTTPException(status_code=404, detail=result.get('error', 'No info'))
-#     return result
