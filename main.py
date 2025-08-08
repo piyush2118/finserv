@@ -10,7 +10,7 @@ import numpy as np
 import pandas as pd
 import requests
 from dotenv import load_dotenv
-from fastapi import FastAPI, Depends, HTTPException, status
+from fastapi import FastAPI, Depends, HTTPException, status, Request
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from pydantic import BaseModel
 from pydantic_settings import BaseSettings
@@ -456,6 +456,35 @@ class LLMDecisionEngine:
             "summary": summary,
             "sources": [f"{c['doc_id']}:{c['chunk_id']}" for c in chunks]
         }
+    
+    def answer_question_direct(self, question: str, relevant_chunks: list) -> str:
+        """
+        Ask Gemini for a direct, professional answer to a factual question, given context.
+        """
+        context = "\n".join([f"- {chunk['text']}" for chunk in relevant_chunks])
+        prompt = f"""You are an expert insurance policy FAQ bot.
+
+    Goal: Answer the following customer question about the policy using ONLY the provided excerpts.
+    - If the exact answer is stated in the text, quote or paraphrase it concisely.
+    - Do NOT add information not present in the context.
+    - If the answer is NOT present, reply: "The policy document does not specify this information."
+    - Do not speculate, hedge, or reference other products. Do not repeat the question. Answer ONLY for the provided policy.
+    - Format the answer as a single clear sentence or paragraph, without disclaimers or apologies.
+
+    QUESTION:
+    {question}
+
+    EXCERPTS FROM POLICY DOCUMENT:
+    {context}
+
+    INSTRUCTION: Answer as above."""
+        try:
+            response = self.model.generate_content(prompt)
+            return response.text.strip()
+        except Exception as e:
+            print(f"❌ Error from LLM: {e}")
+            return "The policy document does not specify this information."
+
 # DocumentQuerySystem
 class DocumentQuerySystem:
     def __init__(self):
@@ -547,6 +576,30 @@ class DocumentQuerySystem:
             "relevant_clauses": [c["text"] for c in hits],
             "sources":         [f"{c['doc_id']}:{c['chunk_id']}" for c in hits]
         }, status.HTTP_200_OK)
+    
+
+    def answer_questions(self, questions: list) -> dict:   
+    
+        if not self.inited:
+            return {"error": "Service not initialized"}, 503
+        
+        answers = []
+        
+        for q in questions:
+
+            # 1) Retrieve all relevant chunks (you said these are perfect already)
+            hits = self.ss.search(q, Config.TOP_K_RETRIEVAL)
+            if not hits:
+                return {"error": "No relevant information found"}, 404
+
+            # 2) Ask the LLM for a clean summary
+            info = self.de.make_information(q, hits)
+            answers.append(info.get("summary"))
+
+            # 3) Return exactly the summary + the chunks that produced it
+            return (
+                {"answer": answers}, status.HTTP_200_OK)
+
 # ==================== App Startup ====================
 @app.on_event('startup')
 def on_startup():
@@ -567,6 +620,7 @@ def login(creds: HTTPBasicCredentials = Depends(security)):
 @app.post('/auth/logout')
 def logout():
     return {'message':'Logged out'}
+
 
 @app.post('/admin/users', status_code=201)
 def create_user(u: UserCreate, cur=Depends(get_current_user)):
@@ -632,8 +686,12 @@ def emp_info(req: QueryRequest, cur=Depends(get_current_user)):
     if st!=0: raise HTTPException(400,res)
     return res
 
-
-
+@app.post('/hackrx/run')
+def emp_ans(req: QueryRequest, cur=Depends(get_current_user)):
+    if cur['role']!='employee': raise HTTPException(403,'Employee required')
+    res, st = system.answer_questions(req.query['questions'])
+    if st!=0: raise HTTPException(400,res)
+    return res
 
 
 
